@@ -16,7 +16,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import CONF_CHANNEL, CONF_REOLINK_ENTRY_IDS, DEFAULT_CHANNEL, DOMAIN
-from .talk import ffmpeg_to_pcm_s16le, fetch_bytes, ima_adpcm_encode_dvi_blocks, parse_talk_ability, talk_playback
+from .connection import BaichuanSession, TalkCache
+from .talk import ffmpeg_to_pcm_s16le, fetch_bytes, ima_adpcm_encode_dvi_blocks, talk_playback
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -43,6 +44,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
     reolink_entries = {e.entry_id: e for e in hass.config_entries.async_entries("reolink")}
 
+    # One cache file for the whole integration; each camera writes its own section.
+    cache = TalkCache(hass)
+
     entities: list[ReolinkTalkPlayer] = []
     for reolink_entry_id in reolink_entry_ids:
         re_entry = reolink_entries.get(reolink_entry_id)
@@ -66,7 +70,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             )
         except KeyError:
             continue
-        entities.append(ReolinkTalkPlayer(hass, reolink_entry_id, target, mp_name))
+        entities.append(ReolinkTalkPlayer(hass, reolink_entry_id, target, mp_name, cache))
 
     async_add_entities(entities, update_before_add=False)
 
@@ -87,7 +91,7 @@ class ReolinkTalkPlayer(MediaPlayerEntity):
     # Older HA versions model this as a plain string, not an enum.
     _attr_device_class = "speaker"
 
-    def __init__(self, hass: HomeAssistant, reolink_entry_id: str, target: ReolinkTarget, mp_name: str) -> None:
+    def __init__(self, hass: HomeAssistant, reolink_entry_id: str, target: ReolinkTarget, mp_name: str, cache: TalkCache) -> None:
         self.hass = hass
         self._reolink_entry_id = reolink_entry_id
         self._target = target
@@ -97,18 +101,35 @@ class ReolinkTalkPlayer(MediaPlayerEntity):
         self._attr_unique_id = f"{DOMAIN}:{reolink_entry_id}:{target.channel}"
         self._attr_volume_level = 1.0
         self._lock = asyncio.Lock()
-        self._last_ability = None
+        self._session = BaichuanSession(
+            hass=hass,
+            host=target.host,
+            port=target.port,
+            http_port=target.http_port,
+            use_https=target.use_https,
+            username=target.username,
+            password=target.password,
+            channel=target.channel,
+            cache=cache,
+            cache_key=f"{reolink_entry_id}_{target.channel}",
+        )
 
     async def async_added_to_hass(self) -> None:
-        # Lightweight, best-effort probe to decide if the camera supports talk.
-        # We keep the entity available even if the probe fails (camera offline),
-        # but if the camera explicitly reports a non-ADPCM talk type, we mark it
-        # unavailable to avoid confusion.
-        try:
-            await self._probe_ability(timeout_s=3.0)
-        except Exception:
-            # Offline or transient failure; do not mark unavailable.
-            return
+        await self._session.load_ability_cache()
+        ability = self._session.cached_ability
+        if ability is None:
+            # No disk cache yet: connect once at startup to validate camera support.
+            try:
+                async with asyncio.timeout(3.0):
+                    ability = await self._session.get_ability()
+            except Exception:
+                return
+        if ability.audio_type.lower() != "adpcm":
+            self._attr_available = False
+            self.async_write_ha_state()
+
+    async def async_will_remove_from_hass(self) -> None:
+        await self._session.close()
 
     async def async_browse_media(self, media_content_type=None, media_content_id=None):
         """Expose the standard HA media-source tree (includes TTS providers)."""
@@ -236,35 +257,40 @@ class ReolinkTalkPlayer(MediaPlayerEntity):
         return await fetch_bytes(self.hass, media_url)
 
     async def _play_bytes(self, media_bytes: bytes) -> None:
-        # Lazy imports: `reolink_aio` is already in HA because the official
-        # Reolink integration uses it.
-        from homeassistant.helpers.aiohttp_client import async_get_clientsession
-        from reolink_aio.api import Host
+        ability = self._session.cached_ability
 
-        # 1) Connect and fetch TalkAbility to determine ADPCM parameters
-        host = Host(
-            host=self._target.host,
-            username=self._target.username,
-            password=self._target.password,
-            port=self._target.http_port,
-            use_https=self._target.use_https,
-            bc_port=self._target.port,
-            aiohttp_get_session_callback=lambda: async_get_clientsession(self.hass),
-        )
-        bc = host.baichuan
-
-        try:
-            await bc.login()
-            ability = await self._probe_ability()
+        if ability is not None:
+            # Ability is known (from disk cache or session cache).
+            # Fire connection work in background while encoding audio so both
+            # happen in parallel — encoding (~200 ms) hides the network cost.
+            bc_exists = self._session.bc is not None
+            if bc_exists:
+                # Connection open: probe to confirm liveness and reset idle timer.
+                bg_task = asyncio.ensure_future(self._session.probe())
+            else:
+                # Not connected: (re)connect while encoding.
+                bg_task = asyncio.ensure_future(self._session.ensure_connected())
+            try:
+                full_block_size = (int(ability.length_per_encoder) // 2) + 4
+                pcm = await ffmpeg_to_pcm_s16le(
+                    media_bytes,
+                    sample_rate=ability.sample_rate,
+                    volume=float(self._attr_volume_level or 1.0),
+                )
+                adpcm_bytes = ima_adpcm_encode_dvi_blocks(pcm, full_block_size=full_block_size)
+                if bc_exists:
+                    bc = self._session.bc if await bg_task else await self._session.ensure_connected()
+                else:
+                    bc = await bg_task
+            except Exception:
+                bg_task.cancel()
+                raise
+        else:
+            # No cache at all (first run ever): connect and fetch ability sequentially.
+            bc = await self._session.ensure_connected()
+            ability = await self._session.get_ability()
             if ability.audio_type.lower() != "adpcm":
                 raise RuntimeError(f"Unsupported Reolink talk audioType={ability.audio_type}")
-
-            # 2) Transcode input -> PCM -> DVI-4 ADPCM blocks.
-            #
-            # Neolink expects ADPCM in "DVI-4" block layout with:
-            # full_block_size = (lengthPerEncoder / 2) + 4
-            #
-            # This is NOT the same as WAV ADPCM block_align.
             full_block_size = (int(ability.length_per_encoder) // 2) + 4
             pcm = await ffmpeg_to_pcm_s16le(
                 media_bytes,
@@ -273,46 +299,10 @@ class ReolinkTalkPlayer(MediaPlayerEntity):
             )
             adpcm_bytes = ima_adpcm_encode_dvi_blocks(pcm, full_block_size=full_block_size)
 
-            # 3) Send over Baichuan talk (cmd 201/202/11)
-            await talk_playback(bc, self._target.channel, adpcm_bytes, ability, block_align=full_block_size)
-        finally:
-            try:
-                await host.logout()
-            except Exception:  # best-effort
-                pass
-
-    async def _probe_ability(self, *, timeout_s: float = 5.0):
-        from homeassistant.helpers.aiohttp_client import async_get_clientsession
-        from reolink_aio.api import Host
-
-        # Cache within the entity instance to avoid extra round-trips.
-        if self._last_ability is not None:
-            return self._last_ability
-
-        host = Host(
-            host=self._target.host,
-            username=self._target.username,
-            password=self._target.password,
-            port=self._target.http_port,
-            use_https=self._target.use_https,
-            bc_port=self._target.port,
-            aiohttp_get_session_callback=lambda: async_get_clientsession(self.hass),
+        new_hints = await talk_playback(
+            bc, self._target.channel, adpcm_bytes, ability,
+            block_align=full_block_size,
+            hints=self._session.cached_hints,
         )
-        bc = host.baichuan
-        try:
-            async with asyncio.timeout(timeout_s):
-                await bc.login()
-                ability_xml = await bc.send(cmd_id=10, channel=self._target.channel)
-            ability = parse_talk_ability(ability_xml)
-            self._last_ability = ability
-
-            if ability.audio_type.lower() != "adpcm":
-                # Explicitly unsupported.
-                self._attr_available = False
-                self.async_write_ha_state()
-            return ability
-        finally:
-            try:
-                await host.logout()
-            except Exception:
-                pass
+        self._session.touch()
+        await self._session.save_hints(new_hints)

@@ -31,6 +31,12 @@ class TalkAbility:
     sound_track: str
 
 
+@dataclass(frozen=True)
+class TalkProtocolHints:
+    enc_type: str        # "AES" or "BC" — name of bc_util.EncType enum member
+    talk_config_variant: int  # index into build_talk_config_variants()
+
+
 def _first_text(root: ET.Element, path: str) -> str | None:
     el = root.find(path)
     if el is None or el.text is None:
@@ -143,47 +149,6 @@ def build_talk_config_variants(channel: int, ability: TalkAbility) -> list[str]:
     return variants
 
 
-def _riff_chunks(wav: bytes):
-    if len(wav) < 12 or wav[0:4] != b"RIFF" or wav[8:12] != b"WAVE":
-        raise ValueError("Not a RIFF/WAVE file")
-    off = 12
-    while off + 8 <= len(wav):
-        cid = wav[off : off + 4]
-        size = int.from_bytes(wav[off + 4 : off + 8], "little")
-        data_off = off + 8
-        data_end = data_off + size
-        # Be tolerant: ffmpeg output can occasionally be cut short (or the RIFF
-        # size fields can be inconsistent). If we can still extract `fmt ` and
-        # partial `data`, that is better than hard-failing the whole service call.
-        truncated = data_end > len(wav)
-        if truncated:
-            data_end = len(wav)
-        yield cid, wav[data_off:data_end]
-        if truncated:
-            break
-        off = data_end + (size % 2)  # chunks are word-aligned
-
-
-def extract_wav_fmt_and_data(wav: bytes) -> tuple[dict, bytes]:
-    fmt: dict = {}
-    data: bytes | None = None
-    for cid, payload in _riff_chunks(wav):
-        if cid == b"fmt ":
-            if len(payload) < 16:
-                raise ValueError("Invalid fmt chunk")
-            fmt["audio_format"] = int.from_bytes(payload[0:2], "little")
-            fmt["channels"] = int.from_bytes(payload[2:4], "little")
-            fmt["sample_rate"] = int.from_bytes(payload[4:8], "little")
-            fmt["byte_rate"] = int.from_bytes(payload[8:12], "little")
-            fmt["block_align"] = int.from_bytes(payload[12:14], "little")
-            fmt["bits_per_sample"] = int.from_bytes(payload[14:16], "little")
-        elif cid == b"data":
-            data = payload
-    if not fmt or data is None:
-        raise ValueError("WAV missing fmt or data chunk")
-    return fmt, data
-
-
 def bcmedia_adpcm_packet(block: bytes) -> bytes:
     # Port of neolink bcmedia_adpcm() + padding rules.
     # block must be: 4 bytes predictor state + N bytes adpcm payload.
@@ -251,148 +216,6 @@ async def fetch_bytes(hass: HomeAssistant, url: str) -> bytes:
         return await resp.read()
 
 
-async def ffmpeg_to_adpcm_wav(
-    input_bytes: bytes,
-    sample_rate: int,
-    length_per_encoder: int,
-    *,
-    volume: float = 1.0,
-) -> bytes:
-    # Convert arbitrary audio to ADPCM IMA WAV with a predictable block layout.
-    # `length_per_encoder` comes from TalkAbility (typically 1024).
-    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
-    cmd = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-i",
-        "pipe:0",
-        # Volume is applied in software. This provides a consistent UX even if a
-        # camera model does not support hardware "speak volume" control.
-        "-af",
-        f"volume={max(0.0, float(volume))}",
-        "-ac",
-        "1",
-        "-ar",
-        str(sample_rate),
-        "-c:a",
-        "adpcm_ima_wav",
-        "-block_size",
-        str(length_per_encoder),
-        "-f",
-        "wav",
-        "pipe:1",
-    ]
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    assert proc.stdin and proc.stdout
-    out, err = await proc.communicate(input_bytes)
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed: {err.decode('utf-8', 'ignore')}")
-    return out
-
-
-# IMA/DVI ADPCM encoder tables (standard IMA ADPCM).
-_IMA_INDEX_TABLE: Final[list[int]] = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8]
-_IMA_STEP_TABLE: Final[list[int]] = [
-    7,
-    8,
-    9,
-    10,
-    11,
-    12,
-    13,
-    14,
-    16,
-    17,
-    19,
-    21,
-    23,
-    25,
-    28,
-    31,
-    34,
-    37,
-    41,
-    45,
-    50,
-    55,
-    60,
-    66,
-    73,
-    80,
-    88,
-    97,
-    107,
-    118,
-    130,
-    143,
-    157,
-    173,
-    190,
-    209,
-    230,
-    253,
-    279,
-    307,
-    337,
-    371,
-    408,
-    449,
-    494,
-    544,
-    598,
-    658,
-    724,
-    796,
-    876,
-    963,
-    1060,
-    1166,
-    1282,
-    1411,
-    1552,
-    1707,
-    1878,
-    2066,
-    2272,
-    2499,
-    2749,
-    3024,
-    3327,
-    3660,
-    4026,
-    4428,
-    4871,
-    5358,
-    5894,
-    6484,
-    7132,
-    7845,
-    8630,
-    9493,
-    10442,
-    11487,
-    12635,
-    13899,
-    15289,
-    16818,
-    18500,
-    20350,
-    22385,
-    24623,
-    27086,
-    29794,
-    32767,
-]
-
-
 async def ffmpeg_to_pcm_s16le(
     input_bytes: bytes,
     *,
@@ -418,7 +241,6 @@ async def ffmpeg_to_pcm_s16le(
         "s16le",
         "pipe:1",
     ]
-
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdin=asyncio.subprocess.PIPE,
@@ -432,18 +254,26 @@ async def ffmpeg_to_pcm_s16le(
     return out
 
 
-def _ima_encode_nibble(sample: int, predictor: int, step_index: int) -> tuple[int, int, int]:
-    """Encode one PCM sample to a 4-bit IMA ADPCM nibble.
+# IMA/DVI ADPCM encoder tables (standard IMA ADPCM).
+_IMA_INDEX_TABLE: Final[list[int]] = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8]
+_IMA_STEP_TABLE: Final[list[int]] = [
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41,
+    45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190,
+    209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796,
+    876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499,
+    2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845,
+    8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385,
+    24623, 27086, 29794, 32767,
+]
 
-    Returns (nibble, new_predictor, new_step_index).
-    """
+
+def _ima_encode_nibble(sample: int, predictor: int, step_index: int) -> tuple[int, int, int]:
     step = _IMA_STEP_TABLE[step_index]
     diff = sample - predictor
     sign = 0
     if diff < 0:
         sign = 8
         diff = -diff
-
     delta = 0
     vpdiff = step >> 3
     if diff >= step:
@@ -457,56 +287,31 @@ def _ima_encode_nibble(sample: int, predictor: int, step_index: int) -> tuple[in
     if diff >= (step >> 2):
         delta |= 1
         vpdiff += step >> 2
-
-    if sign:
-        predictor -= vpdiff
-    else:
-        predictor += vpdiff
-
-    predictor = max(-32768, min(32767, predictor))
-
-    step_index += _IMA_INDEX_TABLE[delta | sign]
-    step_index = max(0, min(88, step_index))
-
+    predictor = max(-32768, min(32767, predictor + (vpdiff if not sign else -vpdiff)))
+    step_index = max(0, min(88, step_index + _IMA_INDEX_TABLE[delta | sign]))
     return (delta | sign) & 0xF, predictor, step_index
 
 
 def ima_adpcm_encode_dvi_blocks(pcm_s16le: bytes, *, full_block_size: int) -> bytes:
-    """Encode PCM s16le into DVI-4 ADPCM blocks.
-
-    Block layout expected by neolink talk:
-    - 2 bytes: initial predictor sample (i16 LE)
-    - 1 byte: step index
-    - 1 byte: reserved (0)
-    - (full_block_size - 4) bytes: packed nibbles, 2 samples per byte
-    """
-    if full_block_size < 8:
-        raise ValueError("full_block_size too small")
-    if len(pcm_s16le) % 2 != 0:
-        raise ValueError("PCM length must be even (s16le)")
+    """Encode PCM s16le into DVI-4 ADPCM blocks (4-byte header + nibble payload)."""
+    if full_block_size < 8 or len(pcm_s16le) % 2 != 0:
+        raise ValueError("invalid full_block_size or PCM length")
 
     payload_bytes = full_block_size - 4
     payload_samples = payload_bytes * 2
-
-    # Convert pcm bytes to list of i16
     sample_count = len(pcm_s16le) // 2
-    samples = struct.unpack("<" + ("h" * sample_count), pcm_s16le) if sample_count else ()
+    samples = struct.unpack("<" + "h" * sample_count, pcm_s16le) if sample_count else ()
     if not samples:
         return b""
 
-    # Streaming-style: each block header contains the current predictor + index
-    # (the "last output" state), followed by payload_samples ADPCM-coded samples.
     predictor = int(samples[0])
     step_index = 0
-    pos = 1  # first sample is used as initial predictor
-
+    pos = 1
     out = bytearray()
     while pos <= len(samples):
         block = bytearray()
         block += struct.pack("<hBB", predictor, step_index, 0)
-
         nibble_acc = None
-        # Encode a fixed number of samples per block.
         for _ in range(payload_samples):
             s = int(samples[pos]) if pos < len(samples) else 0
             pos += 1
@@ -514,19 +319,15 @@ def ima_adpcm_encode_dvi_blocks(pcm_s16le: bytes, *, full_block_size: int) -> by
             if nibble_acc is None:
                 nibble_acc = nib
             else:
-                block.append((nibble_acc & 0xF) | ((nib & 0xF) << 4))
+                block.append(((nibble_acc & 0xF) << 4) | (nib & 0xF))
                 nibble_acc = None
         if nibble_acc is not None:
             block.append(nibble_acc & 0xF)
-
         if len(block) < full_block_size:
             block.extend(b"\x00" * (full_block_size - len(block)))
         out += block[:full_block_size]
-
-        # Stop once we've consumed all input samples and emitted at least one block.
         if pos >= len(samples):
             break
-
     return bytes(out)
 
 
@@ -589,7 +390,7 @@ async def send_talk_binary(
     if enc_type == bc_util.EncType.BC:
         enc_ext = bc_util.encrypt_baichuan(ext, ch_id)  # enc_offset = ch_id
     else:
-        enc_ext = bc._aes_encrypt(ext)
+        enc_ext = bc._aes_encrypt(ext if isinstance(ext, bytes) else ext.encode())
     payload_offset = len(enc_ext)
     mess_len = payload_offset + len(binary_payload)
 
@@ -618,35 +419,18 @@ async def send_talk_binary(
             payload_offset,
         )
 
-    # Wait for the camera ack like neolink does (it subscribes to MSG_ID_TALK and awaits recv).
-    # Without this, some firmwares may silently drop packets under load.
+    # reolink_aio >= 0.21 no longer exposes bc._transport / bc._protocol directly:
+    # the TCP/UDP transport is now wrapped in bc._connection, which serialises
+    # writes under its own mutex and handles timeouts/connection errors.
+    #
+    # Talk audio frames (cmd 202) are streamed fire-and-forget (the camera does
+    # not ACK each frame); playback timing is handled by the pacing sleeps in
+    # talk_playback(), so send_without_wait() is exactly the right primitive.
     await bc._connect_if_needed()
-    proto = getattr(bc, "_protocol", None)
-    loop = getattr(bc, "_loop", None)
-    if proto is None or loop is None:
-        async with bc._mutex:
-            bc._transport.write(packet)
-        return
-
-    full_mess_id = int.from_bytes(int(ch_id).to_bytes(1, "little") + int(bc._mess_id).to_bytes(3, "little"), "little")
-    receive_future = loop.create_future()
-    proto.receive_futures.setdefault(cmd_id, {})[full_mess_id] = receive_future
-
-    try:
-        async with bc._mutex:
-            bc._transport.write(packet)
-        async with asyncio.timeout(5):
-            await receive_future
-    finally:
-        try:
-            if not receive_future.done():
-                receive_future.cancel()
-        except Exception:
-            pass
-        futs = proto.receive_futures.get(cmd_id, {})
-        futs.pop(full_mess_id, None)
-        if not futs and cmd_id in proto.receive_futures:
-            proto.receive_futures.pop(cmd_id, None)
+    conn = bc._connection
+    if conn is None:
+        raise RuntimeError(f"Baichuan host {getattr(bc, '_host', '?')}: no connection available for talk playback")
+    await conn.send_without_wait(packet, cmd_id=cmd_id)
 
 
 async def talk_playback(
@@ -656,7 +440,8 @@ async def talk_playback(
     ability: TalkAbility,
     *,
     block_align: int | None = None,
-) -> None:
+    hints: TalkProtocolHints | None = None,
+) -> TalkProtocolHints:
     from reolink_aio.exceptions import ApiError
     from reolink_aio.baichuan import util as bc_util
 
@@ -673,62 +458,62 @@ async def talk_playback(
                 raise
         return bc_util.EncType.BC
 
-    async def _stop_talk_best_effort(enc: bc_util.EncType) -> None:
+    async def _stop_talk_best_effort() -> None:
         try:
-            await bc.send(cmd_id=11, channel=channel, enc_type=enc)
+            await bc.send(cmd_id=11, channel=channel, enc_type=enc_used)
             await asyncio.sleep(0.1)
         except Exception:
             pass
 
-    # Send TalkConfig first (cmd 201). If we get 422, stop talk and retry.
-    try:
-        last_err: Exception | None = None
-        enc_used = bc_util.EncType.AES
-        for talk_cfg in build_talk_config_variants(channel, ability):
+    variants = build_talk_config_variants(channel, ability)
+    # Seed enc_used from hints so StopTalk uses the known-good enc_type immediately.
+    _hints_enc: bc_util.EncType | None = None
+    if hints is not None:
+        try:
+            _hints_enc = bc_util.EncType[hints.enc_type]
+        except KeyError:
+            pass
+    enc_used: bc_util.EncType = _hints_enc if _hints_enc is not None else bc_util.EncType.AES
+    variant_idx = 0
+
+    # Try cached (variant, enc) first — skips trial-and-error on known-good cameras.
+    hints_succeeded = False
+    if hints is not None:
+        h_idx = hints.talk_config_variant
+        try:
+            h_enc = bc_util.EncType[hints.enc_type]
+        except KeyError:
+            h_enc = None
+        if h_enc is not None and 0 <= h_idx < len(variants):
             try:
-                enc_used = await _send_with_fallback(201, body=talk_cfg)
-                last_err = None
-                break
-            except ApiError as err:
-                last_err = err
-                rsp = getattr(err, "rspCode", None)
-                if rsp in (400, 422):
-                    # Many firmwares require stopping an existing talk session first.
-                    await _stop_talk_best_effort(bc_util.EncType.AES)
-                    await _stop_talk_best_effort(bc_util.EncType.BC)
-                    continue
-                raise
-        if last_err is not None:
-            _LOGGER.error(
-                "TalkConfig rejected for ch=%s sample_rate=%s length_per_encoder=%s audio_type=%s (rspCode=%s)",
-                channel,
-                ability.sample_rate,
-                ability.length_per_encoder,
-                ability.audio_type,
-                getattr(last_err, "rspCode", None),
-            )
-            raise last_err
-    except ApiError as err:
-        if getattr(err, "rspCode", None) == 422:
-            # Stop talk and retry. Use the same AES->BC fallback logic.
-            await _send_with_fallback(11)
-            last_err = None
-            for talk_cfg in build_talk_config_variants(channel, ability):
+                await bc.send(cmd_id=201, channel=channel, body=variants[h_idx], enc_type=h_enc)
+                enc_used = h_enc
+                variant_idx = h_idx
+                hints_succeeded = True
+            except Exception:
+                pass  # hints stale (firmware update?); fall through to full search
+
+    if not hints_succeeded:
+        # Send TalkConfig first (cmd 201). If we get 422, stop talk and retry.
+        try:
+            last_err: Exception | None = None
+            for v_idx, talk_cfg in enumerate(variants):
                 try:
                     enc_used = await _send_with_fallback(201, body=talk_cfg)
+                    variant_idx = v_idx
                     last_err = None
                     break
-                except ApiError as err2:
-                    last_err = err2
-                    rsp = getattr(err2, "rspCode", None)
-                    if rsp in (400, 422):
-                        await _stop_talk_best_effort(bc_util.EncType.AES)
-                        await _stop_talk_best_effort(bc_util.EncType.BC)
+                except ApiError as err:
+                    last_err = err
+                    rsp = getattr(err, "rspCode", None)
+                    if rsp in (400, 421, 422):
+                        # Many firmwares require stopping an existing talk session first.
+                        await _stop_talk_best_effort()
                         continue
                     raise
             if last_err is not None:
                 _LOGGER.error(
-                    "TalkConfig rejected after stop/retry for ch=%s sample_rate=%s length_per_encoder=%s audio_type=%s (rspCode=%s)",
+                    "TalkConfig rejected for ch=%s sample_rate=%s length_per_encoder=%s audio_type=%s (rspCode=%s)",
                     channel,
                     ability.sample_rate,
                     ability.length_per_encoder,
@@ -736,27 +521,66 @@ async def talk_playback(
                     getattr(last_err, "rspCode", None),
                 )
                 raise last_err
-        else:
-            raise
+        except ApiError as err:
+            if getattr(err, "rspCode", None) in (421, 422):
+                # Stop talk and retry. Best-effort: 421 on StopTalk = camera rejects
+                # it (wrong owner / no session) — swallow and retry TalkConfig anyway.
+                await _stop_talk_best_effort()
+                last_err = None
+                for v_idx, talk_cfg in enumerate(variants):
+                    try:
+                        enc_used = await _send_with_fallback(201, body=talk_cfg)
+                        variant_idx = v_idx
+                        last_err = None
+                        break
+                    except ApiError as err2:
+                        last_err = err2
+                        rsp = getattr(err2, "rspCode", None)
+                        if rsp in (400, 421, 422):
+                            await _stop_talk_best_effort()
+                            continue
+                        raise
+                if last_err is not None:
+                    _LOGGER.error(
+                        "TalkConfig rejected after stop/retry for ch=%s sample_rate=%s length_per_encoder=%s audio_type=%s (rspCode=%s)",
+                        channel,
+                        ability.sample_rate,
+                        ability.length_per_encoder,
+                        ability.audio_type,
+                        getattr(last_err, "rspCode", None),
+                    )
+                    raise last_err
+            else:
+                raise
 
-    # `lengthPerEncoder` in TalkAbility is not consistently documented across
-    # models/firmware. In practice, the WAV `block_align` coming out of ffmpeg is
-    # the most reliable "bytes per ADPCM block" value for chunking and pacing.
     full_block_size = int(block_align or ability.length_per_encoder)
     payloads = talk_binary_payload(adpcm_bytes, full_block_size, blocks_per_payload=4)
 
     try:
+        # Deadline-based pacing: each payload is sent at an absolute target time
+        # derived from t0. asyncio.sleep drift in one iteration is corrected by
+        # the shorter sleep in the next, so the camera never starves of data.
+        t0 = asyncio.get_event_loop().time()
+        cumulative_duration = 0.0
         for payload, blocks_in_payload in payloads:
             await send_talk_binary(bc, channel, payload, enc_type=enc_used)
-
-            # Pace like neolink: sleep for the playback time of the data we just sent.
             adpcm_len = full_block_size * blocks_in_payload
             samples_sent = (adpcm_len - 4 * blocks_in_payload) * 2 + blocks_in_payload
-            play_length = samples_sent / float(ability.sample_rate)
-            await asyncio.sleep(play_length)
+            cumulative_duration += samples_sent / float(ability.sample_rate)
+            remaining = t0 + cumulative_duration - asyncio.get_event_loop().time()
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+        # Wait until playback should be complete, plus 50ms network grace.
+        # If the last deadline sleep already drifted past this point, skip.
+        t_done = t0 + cumulative_duration + 0.05
+        remaining = t_done - asyncio.get_event_loop().time()
+        if remaining > 0:
+            await asyncio.sleep(remaining)
     finally:
         try:
             await bc.send(cmd_id=11, channel=channel, enc_type=enc_used)
         except Exception:
             # Best-effort stop; do not mask the primary exception.
             pass
+
+    return TalkProtocolHints(enc_type=enc_used.name, talk_config_variant=variant_idx)
